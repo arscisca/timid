@@ -1,8 +1,5 @@
-use std::fmt::Write;
+use std::cmp::Ordering;
 use std::path::Path;
-use svg::{node::element, Node};
-
-use crate::{Signal, State, Value};
 
 pub struct TimingDiagram {
     signals: Vec<Signal>,
@@ -23,122 +20,130 @@ impl TimingDiagram {
         self.signals.push(signal)
     }
 
-    pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        let renderer = Renderer::new(self);
-        renderer.render(path)
+    pub fn render<P: AsRef<Path>>(&self, path: P) -> Result<(), anyhow::Error> {
+        crate::render::render(self, path)
     }
 }
 
-struct Renderer<'d> {
-    diagram: &'d TimingDiagram,
-    svg: element::SVG,
+pub type Timestamp = u64;
+
+#[derive(Debug)]
+pub struct Signal {
+    name: Box<str>,
+    states: Box<[State]>,
 }
 
-impl<'d> Renderer<'d> {
-    const WAVE_HEIGHT: i32 = 10;
+impl Signal {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 
-    pub fn new(diagram: &'d TimingDiagram) -> Self {
+    pub fn states(&self) -> &[State] {
+        &self.states
+    }
+
+    pub fn sample(&self, t: Timestamp) -> &Value {
+        match self
+            .states
+            .binary_search_by_key(&t, |state| state.timestamp)
+        {
+            Ok(i) => &self.states[i].value,
+            Err(i) => &self.states[i].value,
+        }
+    }
+}
+
+pub struct SignalBuilder {
+    name: Box<str>,
+    states: std::collections::BinaryHeap<StateOrd>,
+}
+
+impl SignalBuilder {
+    pub fn new<S: Into<Box<str>>>(name: S) -> Self {
         Self {
-            diagram,
-            svg: element::SVG::new(),
+            name: name.into(),
+            states: Default::default(),
         }
     }
 
-    pub fn render<P: AsRef<Path>>(mut self, path: P) -> std::io::Result<()> {
-        self.svg.assign("viewBox", (0, 0, 100, 100));
-        let signals = self.diagram.signals();
-        let waves = self.render_waves(signals)
-            .set("transform", "translate(10, 20)");
-        self.svg.append(waves);
-        svg::save(path, &self.svg)
+    pub fn with_states<I: IntoIterator<Item = State>>(mut self, states: I) -> Self {
+        let iter = states.into_iter();
+        self.states.reserve(iter.size_hint().0);
+        for state in iter {
+            self.add_state(state);
+        }
+        self
     }
 
-    fn render_waves(&self, signals: &[Signal]) -> element::Group {
-        let mut waves = element::Group::new();
-        waves.assign("id", "waves");
-        waves.append(
-            element::Style::new("\
-                .wave {\
-                    fill: none; \
-                    stroke: red; \
-                    stroke-width: 0.5;\
-                }\
-                .wave:hover{\
-                    stroke: black;\
-                }")
-        );
-        for signal in signals {
-            let wave = self.render_wave(signal)
-                .set("class", "wave")
-                .set("transform", "scale(1, -1)");
-            waves.append(wave);
-        }
-        waves
+    pub fn add_state(&mut self, state: State) {
+        let ord = StateOrd(state);
+        self.states.push(ord)
     }
 
-    fn render_wave(&self, signal: &Signal) -> element::Group {
-        let mut t = 0;
-        let mut group = element::Group::new().set("id", format!("wave:{}", signal.name));
-        if signal.states.is_empty() {
-            return group;
-        }
-        // Draw the first value.
-        if let Some(first) = signal.states.first() {
-            group.append(self.render_state(t, first));
-            let dt: i32 = first.duration.into();
-            t += dt;
-        }
-        for window in signal.states.windows(2) {
-            let (prev, curr) = (&window[0], &window[1]);
-            group.append(self.render_state_transition(t, &prev.value, &curr.value));
-            group.append(self.render_state(t, curr));
-            let dt: i32 = curr.duration.into();
-            t += dt;
-        }
-        group
+    pub fn build(self) -> Signal {
+        self.into()
     }
+}
 
-    fn render_state(&self, t: i32, state: &State) -> Box<dyn Node> {
-        match &state.value {
-            v @ (Value::V0 | Value::V1) => {
-                let y = match v {
-                    Value::V0 => 0,
-                    Value::V1 => Self::WAVE_HEIGHT,
-                };
-                let dt: i32 = state.duration.into();
-                let data = element::path::Data::new().move_to((t, y)).line_by((dt, 0));
-                let path = element::Path::new()
-                    .set("d", data);
-                Box::new(path)
-            }
+impl From<SignalBuilder> for Signal {
+    fn from(value: SignalBuilder) -> Self {
+        let states: Vec<State> = value
+            .states
+            .into_sorted_vec()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        Self {
+            name: value.name,
+            states: states.into(),
         }
     }
+}
 
-    fn render_state_transition(&self, t: i32, v1: &Value, v2: &Value) -> Box<dyn Node> {
-        match (v1, v2) {
-            (Value::V0, Value::V0) | (Value::V1, Value::V1) => {
-                // No transition here.
-                Box::new(element::Path::new())
-            }
-            (Value::V0, Value::V1) => {
-                let data = element::path::Data::new()
-                    .move_to((t, 0))
-                    .line_by((0, Self::WAVE_HEIGHT));
-                let path = element::Path::new()
-                    .set("d", data);
-                Box::new(path)
-            }
-            (Value::V1, Value::V0) => {
-                let data = element::path::Data::new()
-                    .move_to((t, Self::WAVE_HEIGHT))
-                    .line_by((0, -Self::WAVE_HEIGHT));
-                let path = element::Path::new()
-                    .set("d", data);
-                Box::new(path)
-            }
-            (v1, v2) => {
-                panic!("unsupported state transition from {:?} to {:?}", v1, v2);
-            }
-        }
+struct StateOrd(State);
+
+impl PartialEq for StateOrd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.timestamp.eq(&other.0.timestamp)
+    }
+}
+
+impl Eq for StateOrd {}
+
+impl PartialOrd for StateOrd {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StateOrd {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.timestamp.cmp(&other.0.timestamp)
+    }
+}
+
+impl From<StateOrd> for State {
+    fn from(value: StateOrd) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum Value {
+    V0,
+    V1,
+    VX,
+    VZ,
+}
+
+#[derive(Debug, Clone)]
+pub struct State {
+    pub value: Value,
+    pub timestamp: Timestamp,
+}
+
+impl State {
+    pub fn new(value: Value, timestamp: Timestamp) -> Self {
+        Self { value, timestamp }
     }
 }
